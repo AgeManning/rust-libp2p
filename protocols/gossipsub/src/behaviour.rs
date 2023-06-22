@@ -324,7 +324,7 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     published_message_ids: DuplicateCache<MessageId>,
 
     /// Short term cache for fast message ids mapping them to the real message ids
-    fast_message_id_cache: TimeCache<FastMessageId, MessageId>,
+    fast_message_id_cache: TimeCache<FastMessageId, (MessageId, TopicHash)>,
 
     /// The filter used to handle message subscriptions.
     subscription_filter: F,
@@ -1705,7 +1705,8 @@ where
                 );
                 self.handle_invalid_message(
                     propagation_source,
-                    raw_message,
+                    &raw_message.topic,
+                    Some(msg_id),
                     RejectReason::BlackListedSource,
                 );
                 return false;
@@ -1733,7 +1734,12 @@ where
                 "Dropping message {} claiming to be from self but forwarded from {}",
                 msg_id, propagation_source
             );
-            self.handle_invalid_message(propagation_source, raw_message, RejectReason::SelfOrigin);
+            self.handle_invalid_message(
+                propagation_source,
+                &raw_message.topic,
+                Some(msg_id),
+                RejectReason::SelfOrigin,
+            );
             return false;
         }
 
@@ -1753,28 +1759,50 @@ where
             metrics.msg_recvd_unfiltered(&raw_message.topic, raw_message.raw_protobuf_len());
         }
 
+        // If we are not subscribed to the topic, drop it. Don't bother with the message ID. Also,
+        // penalize the peer for sending it to us.
+        if !self.mesh.contains_key(&raw_message.topic) {
+            // Reject the message and return
+            self.handle_invalid_message(
+                propagation_source,
+                &raw_message.topic,
+                None,
+                RejectReason::ValidationError(ValidationError::InvalidTopic),
+            );
+
+            debug!(
+                "Received message on a topic we are not subscribed to: {:?}",
+                raw_message.topic
+            );
+            return;
+        }
+
         let fast_message_id = self.config.fast_message_id(&raw_message);
 
+        // Check for duplicates and filter them
         if let Some(fast_message_id) = fast_message_id.as_ref() {
-            if let Some(msg_id) = self.fast_message_id_cache.get(fast_message_id) {
-                let msg_id = msg_id.clone();
-                // Report the duplicate
-                if self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
-                    if let Some((peer_score, ..)) = &mut self.peer_score {
-                        peer_score.duplicated_message(
-                            propagation_source,
-                            &msg_id,
-                            &raw_message.topic,
-                        );
+            if let Some((msg_id, topic)) = self.fast_message_id_cache.get(fast_message_id) {
+                // Segregate duplicates based on topics
+                if topic == &raw_message.topic {
+                    let msg_id = msg_id.clone();
+                    // Report the duplicate
+                    if self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
+                        if let Some((peer_score, ..)) = &mut self.peer_score {
+                            peer_score.duplicated_message(
+                                propagation_source,
+                                &msg_id,
+                                &raw_message.topic,
+                            );
+                        }
+                        // Update the cache, informing that we have received a duplicate from another peer.
+                        // The peers in this cache are used to prevent us forwarding redundant messages onto
+                        // these peers.
+                        self.mcache.observe_duplicate(&msg_id, propagation_source);
                     }
-                    // Update the cache, informing that we have received a duplicate from another peer.
-                    // The peers in this cache are used to prevent us forwarding redundant messages onto
-                    // these peers.
-                    self.mcache.observe_duplicate(&msg_id, propagation_source);
-                }
 
-                // This message has been seen previously. Ignore it
-                return;
+                    // This message has been seen previously. Ignore it
+                    return;
+                }
             }
         }
 
@@ -1783,10 +1811,16 @@ where
             Ok(message) => message,
             Err(e) => {
                 debug!("Invalid message. Transform error: {:?}", e);
+                let message_id = fast_message_id.as_ref().and_then(|f_msg_id| {
+                    self.fast_message_id_cache
+                        .get(f_msg_id)
+                        .map(|(msg_id, _topic)| msg_id.clone())
+                });
                 // Reject the message and return
                 self.handle_invalid_message(
                     propagation_source,
-                    &raw_message,
+                    &raw_message.topic,
+                    message_id.as_ref(),
                     RejectReason::ValidationError(ValidationError::TransformFailed),
                 );
                 return;
@@ -1808,7 +1842,7 @@ where
             // add id to cache
             self.fast_message_id_cache
                 .entry(fast_message_id)
-                .or_insert_with(|| msg_id.clone());
+                .or_insert_with(|| (msg_id.clone(), message.topic.clone()));
         }
 
         if !self.duplicate_cache.insert(msg_id.clone()) {
@@ -1819,7 +1853,7 @@ where
             self.mcache.observe_duplicate(&msg_id, propagation_source);
             return;
         }
-        debug!(
+        trace!(
             "Put message {:?} in duplicate_cache and resolve promises",
             msg_id
         );
@@ -1840,21 +1874,13 @@ where
         self.mcache.put(&msg_id, raw_message.clone());
 
         // Dispatch the message to the user if we are subscribed to any of the topics
-        if self.mesh.contains_key(&message.topic) {
-            debug!("Sending received message to user");
-            self.events
-                .push_back(ToSwarm::GenerateEvent(Event::Message {
-                    propagation_source: *propagation_source,
-                    message_id: msg_id.clone(),
-                    message,
-                }));
-        } else {
-            debug!(
-                "Received message on a topic we are not subscribed to: {:?}",
-                message.topic
-            );
-            return;
-        }
+        debug!("Sending received message to user");
+        self.events
+            .push_back(ToSwarm::GenerateEvent(Event::Message {
+                propagation_source: *propagation_source,
+                message_id: msg_id.clone(),
+                message,
+            }));
 
         // forward the message to mesh peers, if no validation is required
         if !self.config.validate_messages() {
@@ -1869,7 +1895,7 @@ where
             {
                 error!("Failed to forward message. Too large");
             }
-            debug!("Completed message handling for message: {:?}", msg_id);
+            trace!("Completed message handling for message: {:?}", msg_id);
         }
     }
 
@@ -1877,33 +1903,23 @@ where
     fn handle_invalid_message(
         &mut self,
         propagation_source: &PeerId,
-        raw_message: &RawMessage,
+        topic: &TopicHash,
+        message_id: Option<&MessageId>,
         reject_reason: RejectReason,
     ) {
         if let Some((peer_score, .., gossip_promises)) = &mut self.peer_score {
             if let Some(metrics) = self.metrics.as_mut() {
-                metrics.register_invalid_message(&raw_message.topic);
+                metrics.register_invalid_message(topic);
             }
 
-            let fast_message_id_cache = &self.fast_message_id_cache;
-
-            if let Some(msg_id) = self
-                .config
-                .fast_message_id(raw_message)
-                .and_then(|id| fast_message_id_cache.get(&id))
-            {
-                peer_score.reject_message(
-                    propagation_source,
-                    msg_id,
-                    &raw_message.topic,
-                    reject_reason,
-                );
+            if let Some(msg_id) = message_id {
+                peer_score.reject_message(propagation_source, msg_id, topic, reject_reason);
                 gossip_promises.reject_message(msg_id, &reject_reason);
             } else {
                 // The message is invalid, we reject it ignoring any gossip promises. If a peer is
                 // advertising this message via an IHAVE and it's invalid it will be double
                 // penalized, one for sending us an invalid and again for breaking a promise.
-                peer_score.reject_invalid_message(propagation_source, &raw_message.topic);
+                peer_score.reject_invalid_message(propagation_source, topic);
             }
         }
     }
@@ -3394,9 +3410,18 @@ where
                 // Handle any invalid messages from this peer
                 if self.peer_score.is_some() {
                     for (raw_message, validation_error) in invalid_messages {
+                        let message_id =
+                            self.config
+                                .fast_message_id(&raw_message)
+                                .and_then(|f_msg_id| {
+                                    self.fast_message_id_cache
+                                        .get(&f_msg_id)
+                                        .map(|(msg_id, _topic)| msg_id.clone())
+                                });
                         self.handle_invalid_message(
                             &propagation_source,
-                            &raw_message,
+                            &raw_message.topic,
+                            message_id.as_ref(),
                             RejectReason::ValidationError(validation_error),
                         )
                     }

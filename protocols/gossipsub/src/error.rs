@@ -105,6 +105,8 @@ pub enum ValidationError {
     MessageSourcePresent,
     /// The data transformation failed.
     TransformFailed,
+    /// We are not subscribed to the topic.
+    InvalidTopic,
 }
 
 impl std::fmt::Display for ValidationError {
