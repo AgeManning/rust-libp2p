@@ -1166,6 +1166,7 @@ fn test_handle_ihave_subscribed_and_msg_cached() {
         .create_network();
 
     let msg_id = MessageId::new(b"known id");
+    gs.duplicate_cache.insert(msg_id.clone());
 
     let events_before = gs.events.len();
     gs.handle_ihave(&peers[7], vec![(topic_hashes[0].clone(), vec![msg_id])]);
@@ -4446,7 +4447,7 @@ fn test_ignore_too_many_messages_in_ihave() {
         .max_ihave_length(10)
         .build()
         .unwrap();
-    //build gossipsub with full mesh
+    // build gossipsub with full mesh
     let (mut gs, _, topics) = inject_nodes1()
         .peer_no(config.mesh_n_high())
         .topics(vec!["test".into()])
@@ -4454,10 +4455,10 @@ fn test_ignore_too_many_messages_in_ihave() {
         .gs_config(config.clone())
         .create_network();
 
-    //add another peer not in the mesh
+    // add another peer not in the mesh
     let peer = add_peer(&mut gs, &topics, false, false);
 
-    //peer has 20 messages
+    // peer has 20 messages
     let mut seq = 0;
     let message_ids: Vec<_> = (0..20)
         .map(|_| random_message(&mut seq, &topics))
@@ -4465,7 +4466,7 @@ fn test_ignore_too_many_messages_in_ihave() {
         .map(|msg| config.message_id(&msg))
         .collect();
 
-    //peer sends us three ihaves
+    // peer sends us three ihaves
     gs.handle_ihave(&peer, vec![(topics[0].clone(), message_ids[0..8].to_vec())]);
     gs.handle_ihave(
         &peer,
@@ -4478,7 +4479,7 @@ fn test_ignore_too_many_messages_in_ihave() {
 
     let first_twelve: HashSet<_> = message_ids.iter().take(12).collect();
 
-    //we send iwant only for the first 10 messages
+    // we send iwant only for the first 10 messages
     let mut sum = 0;
     assert_eq!(
         count_control_msgs(&gs, |p, action| match action {
@@ -4496,14 +4497,14 @@ fn test_ignore_too_many_messages_in_ihave() {
 
     assert_eq!(sum, 10, "exactly the first ten ihaves should be processed");
 
-    //after a heartbeat everything is forgotten
+    // after a heartbeat everything is forgotten
     gs.heartbeat();
     gs.handle_ihave(
         &peer,
         vec![(topics[0].clone(), message_ids[10..20].to_vec())],
     );
 
-    //we sent 20 iwant messages
+    // we sent 20 iwant messages
     let mut sum = 0;
     assert_eq!(
         count_control_msgs(&gs, |p, action| match action {
